@@ -1,0 +1,13 @@
+[workflow]
+slug = "datacenter-buildout-2qoayByXsLVQfW"
+root = "."
+runner = "datacenters.__main__:runner"
+
+[build]
+use_gitignore = true
+include = [
+  "pyproject.toml",
+  "uv.lock",
+  "**/*.py",
+]
+

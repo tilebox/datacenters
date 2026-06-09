@@ -1,0 +1,53 @@
+[project]
+name = "datacenters"
+version = "0.1.0"
+description = "A Tilebox workflow for detecting datacenter buildout progress from satellite imagery."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.16",
+    "ty>=0.0.46",
+]
+
+[tool.ruff]
+# settings applying to all ruff subcommands, such as `ruff check` (lint) and `ruff format`
+line-length = 120
+target-version = "py312"
+exclude = [
+    "*/.venv/*",
+]
+
+[tool.ruff.lint]
+select = ["ALL"]
+# all rules: https://beta.ruff.rs/docs/rules
+ignore = [
+    # some ruff checking modules don't make much sense as a whole
+    "D",   # pydocstyle: pretty strict anyways
+    "FBT", # flake8-boolean-trap: boolean arguments can make sense
+    "COM", # flake8-commas: formatter takes care of this
+    "DTZ", # flake8-datetimez: utc datetimes are useful
+    "DJ",  # flake8-django: not needed
+    "EM",  # flake8-errmsg: str directly in Exception constructor is accetable
+    "TC",  # flake8-type-checking: type checking blocks are weird
+    # specific rules
+    "ANN401",  # any-type: allow Any in *args and **kwargs
+    "S101",    # assert: allow usage of assert
+    "B008",    # function-call-argument-default: some default argument values make sense to be function calls
+    "G004",    # logging-f-string: allow usage of f-strings in logging calls
+    "PLR2004", # magic-value-comparison: sometimes comparison with constants (e.g. 0) makes sense
+    "TRY003",  # raise-vanilla-args: exceptions like this make sense in python
+    "TRY400",  # error-instead-of-exception: logger.error is ok with loguru
+    # disabled because of formatter
+    "E501",   # line-too-long -> formatter takes care of this
+    "ISC001", # single-line-implicit-str-concatenation -> formatter takes care of this
+    "Q",      # flake8-quotes -> formatter takes care of this
+    "W191",   # tab-indentation -> formatter takes care of this
+]
+
+unfixable = [
+    "F841", # unused-variable -> don't remove them automatically
+    "ERA",  # eradicate -> (commented out code), don't remove it automatically
+]
