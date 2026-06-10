@@ -9,5 +9,5 @@ include = [
   "pyproject.toml",
   "uv.lock",
   "**/*.py",
+  "datacenters/clay_metadata.yaml",
 ]
-
