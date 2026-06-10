@@ -2,7 +2,7 @@
 
 Tilebox workflow that ranks data center sites by visible Sentinel-2 change between a before and after date.
 
-The root task is `tilebox.com/datacenters/RankDataCenterBuildout@v1.12`. It accepts:
+The root task is `tilebox.com/datacenters/RankDataCenterBuildout@v1.14`. It accepts:
 
 ```json
 {

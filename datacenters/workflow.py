@@ -929,14 +929,14 @@ def _compute_change(  # noqa: PLR0915
         (
             (delta_ndbi_map > 0.08)
             & (after_indices["ndbi"] > 0.0)
-            & (after_indices["ndvi"] < 0.45)
+            & (after_indices["ndvi"] < 0.20)
             & (after_indices["mndwi"] < 0.10)
         )
         | (
             (delta_bsi_map > 0.08)
             & (delta_ndvi_loss_map > 0.08)
             & (after_indices["bsi"] > 0.02)
-            & (after_indices["ndvi"] < 0.40)
+            & (after_indices["ndvi"] < 0.20)
             & (after_indices["mndwi"] < 0.10)
         )
     )
@@ -960,6 +960,8 @@ def _compute_change(  # noqa: PLR0915
     construction_changed_area = _score_scalar(construction_component_metrics["changed_area_ha"], 2.0, 100.0)
     construction_fraction = _score_scalar(construction_pixel_fraction, 0.005, 0.10)
     construction_evidence = max(construction_component_area, construction_changed_area, construction_fraction)
+    construction_direction_score = min(max(built_up_gain, bare_soil_gain, brightness_gain) * 4.0, 100.0)
+    construction_direction_evidence = math.sqrt(construction_evidence * construction_direction_score)
     clay_patch_intensity = max(
         _score_scalar(clay_metrics["clay_patch_distance_p95"], 0.16, 0.45),
         _score_scalar(clay_metrics["clay_patch_distance_top_decile_mean"], 0.18, 0.50),
@@ -971,33 +973,11 @@ def _compute_change(  # noqa: PLR0915
     clay_patch_cluster = math.sqrt(clay_patch_intensity * clay_patch_area)
     structural_change = _score_scalar(ssim["ssim_structural_change"], 0.03, 0.35)
     clay_embedding_change = _score_scalar(clay_metrics["clay_cosine_distance"], 0.02, 0.25)
-    object_evidence = max(construction_evidence, clay_patch_cluster)
-    global_change_gate = _score_scalar(object_evidence, 20.0, 70.0) / 100.0
+    primary_construction_evidence = max(construction_evidence, construction_direction_evidence)
+    construction_clay_agreement = math.sqrt(primary_construction_evidence * clay_patch_cluster)
     water_penalty = float(np.clip((np.nanmean(after_mndwi > 0.2) - 0.1) / 0.4, 0, 1) * 20)
-    weak_construction_direction_penalty = 0.0
-    if (
-        clay_patch_intensity < 50.0
-        and built_up_gain <= 1.0
-        and bare_soil_gain <= 1.0
-        and brightness_gain <= 1.0
-        and structural_change < 70.0
-    ):
-        weak_construction_direction_penalty = (50.0 - clay_patch_intensity) * 2.0
-    coherent_change_cap = 25.0 + 0.75 * coherent_change_evidence
-    raw_score = (
-        0.35 * clay_patch_cluster
-        + 0.30 * construction_evidence
-        + 0.15 * coherent_cva_component_area * global_change_gate
-        + 0.05 * structural_change * global_change_gate
-        + 0.05 * built_up_gain
-        + 0.04 * bare_soil_gain
-        + 0.03 * vegetation_loss
-        + 0.03 * brightness_gain
-    )
-    score = max(
-        0.0,
-        min(raw_score, coherent_change_cap) - water_penalty - weak_construction_direction_penalty,
-    )
+    raw_score = 0.80 * primary_construction_evidence + 0.20 * construction_clay_agreement
+    score = max(0.0, min(raw_score, 100.0) - water_penalty)
 
     return {
         "site_id": site.site_id,
@@ -1021,15 +1001,15 @@ def _compute_change(  # noqa: PLR0915
             "construction_changed_area": round(construction_changed_area, 4),
             "construction_fraction": round(construction_fraction, 4),
             "construction_evidence": round(construction_evidence, 4),
+            "construction_direction_score": round(construction_direction_score, 4),
+            "construction_direction_evidence": round(construction_direction_evidence, 4),
             "ssim_structural_change": round(structural_change, 4),
             "clay_patch_intensity": round(clay_patch_intensity, 4),
             "clay_patch_area": round(clay_patch_area, 4),
             "clay_patch_cluster": round(clay_patch_cluster, 4),
             "clay_embedding_change": round(clay_embedding_change, 4),
-            "object_evidence": round(object_evidence, 4),
-            "global_change_gate": round(global_change_gate, 4),
-            "coherent_change_cap": round(coherent_change_cap, 4),
-            "weak_construction_direction_penalty": round(weak_construction_direction_penalty, 4),
+            "primary_construction_evidence": round(primary_construction_evidence, 4),
+            "construction_clay_agreement": round(construction_clay_agreement, 4),
             "water_penalty": round(water_penalty, 4),
         },
         "metrics": {
@@ -1093,7 +1073,7 @@ class RankDataCenterBuildout(Task):
 
     @staticmethod
     def identifier() -> tuple[str, str]:
-        return "tilebox.com/datacenters/RankDataCenterBuildout", "v1.12"
+        return "tilebox.com/datacenters/RankDataCenterBuildout", "v1.14"
 
     def execute(self, context: ExecutionContext):  # noqa: ANN201
         context.current_task.display = "RankDataCenterBuildout"
@@ -1155,7 +1135,7 @@ class SelectAndCacheScene(Task):
 
     @staticmethod
     def identifier() -> tuple[str, str]:
-        return "tilebox.com/datacenters/SelectAndCacheScene", "v1.12"
+        return "tilebox.com/datacenters/SelectAndCacheScene", "v1.14"
 
     def execute(self, context: ExecutionContext):  # noqa: ANN201, PLR0915
         site = _sites_by_id(context.job_cache["sites.json"])[self.site_id]
@@ -1359,7 +1339,7 @@ class ComputeSiteChange(Task):
 
     @staticmethod
     def identifier() -> tuple[str, str]:
-        return "tilebox.com/datacenters/ComputeSiteChange", "v1.12"
+        return "tilebox.com/datacenters/ComputeSiteChange", "v1.14"
 
     def execute(self, context: ExecutionContext):  # noqa: ANN201
         site = _sites_by_id(context.job_cache["sites.json"])[self.site_id]
@@ -1415,7 +1395,7 @@ class WriteRankingOutput(Task):
 
     @staticmethod
     def identifier() -> tuple[str, str]:
-        return "tilebox.com/datacenters/WriteRankingOutput", "v1.12"
+        return "tilebox.com/datacenters/WriteRankingOutput", "v1.14"
 
     def execute(self, context: ExecutionContext):  # noqa: ANN201
         site_ids = list(_sites_by_id(context.job_cache["sites.json"]))
