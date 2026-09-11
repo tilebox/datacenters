@@ -7,10 +7,10 @@ import os
 import random
 import tempfile
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import niquests
 import numpy as np
@@ -206,7 +206,10 @@ def _first_column(columns: list[str], candidates: list[str]) -> str:
 def _download_sites_csv(csv_url: str) -> pd.DataFrame:
     response = niquests.get(csv_url, timeout=60)
     response.raise_for_status()
-    return pd.read_csv(io.BytesIO(response.content))
+    content = response.content
+    if content is None:
+        raise ValueError(f"CSV response from {csv_url!r} had no content")
+    return pd.read_csv(io.BytesIO(content))
 
 
 def _merge_sites(  # noqa: C901
@@ -306,11 +309,15 @@ def _dataset_candidates(  # noqa: PLR0913
 ) -> list[dict[str, Any]]:
     start, end = _date_window(target_date, window_days)
     area = _site_crop_polygon(latitude, longitude, crop_size_m)
-    data = DatasetClient().dataset("open_data.copernicus.sentinel2_msi").query(
-        collections=SENTINEL2_COLLECTIONS,
-        temporal_extent=(start, end),
-        spatial_extent=area,
-        show_progress=False,
+    data = (
+        DatasetClient()
+        .dataset("open_data.copernicus.sentinel2_msi")
+        .query(
+            collections=SENTINEL2_COLLECTIONS,
+            temporal_extent=(start, end),
+            spatial_extent=area,
+            show_progress=False,
+        )
     )
     if data.sizes.get("time", 0) == 0:
         return []
@@ -459,7 +466,7 @@ def _save_npz(arrays: dict[str, np.ndarray], metadata: dict[str, Any]) -> bytes:
     buffer = io.BytesIO()
     np.savez(
         buffer,
-        **{band_name: arrays[band_name] for band_name in ALL_BAND_NAMES},
+        **{band_name: arrays[band_name] for band_name in ALL_BAND_NAMES},  # ty: ignore[invalid-argument-type]
         SCL=arrays["SCL"],
         metadata=json.dumps(metadata),
     )
@@ -708,13 +715,14 @@ def _clay_model() -> Any:
 
     checkpoint_path = _ensure_clay_checkpoint()
     original_create_model = timm.create_model
+    timm_module = cast(Any, timm)
 
     def create_model_without_pretrained_weights(*args: Any, **kwargs: Any) -> Any:
         kwargs["pretrained"] = False
         return original_create_model(*args, **kwargs)
 
     try:
-        timm.create_model = create_model_without_pretrained_weights
+        timm_module.create_model = create_model_without_pretrained_weights
         model = ClayMAEModule.load_from_checkpoint(
             checkpoint_path,
             map_location="cpu",
@@ -739,7 +747,7 @@ def _clay_model() -> Any:
             shuffle=False,
         )
     finally:
-        timm.create_model = original_create_model
+        timm_module.create_model = original_create_model
 
     torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
     return model.to(torch.device("cpu")).eval()
@@ -752,7 +760,7 @@ def _normalize_latlon(latitude: float, longitude: float) -> tuple[tuple[float, f
 
 
 def _normalize_timestamp(value: str | None) -> tuple[tuple[float, float], tuple[float, float]]:
-    timestamp = datetime.fromisoformat(value) if value else datetime.utcnow()
+    timestamp = datetime.fromisoformat(value) if value else datetime.now(UTC)
     week = timestamp.isocalendar().week * 2 * np.pi / 52
     hour = timestamp.hour * 2 * np.pi / 24
     return (math.sin(week), math.cos(week)), (math.sin(hour), math.cos(hour))
@@ -845,7 +853,9 @@ def _clay_change_metrics(
     after_metadata: dict[str, Any],
 ) -> dict[str, float]:
     before, after, common_shape = _align_common_shape(before, after)
-    before_patches = _clay_patch_embeddings(before, site.latitude, site.longitude, before_metadata.get("acquisition_time"))
+    before_patches = _clay_patch_embeddings(
+        before, site.latitude, site.longitude, before_metadata.get("acquisition_time")
+    )
     after_patches = _clay_patch_embeddings(after, site.latitude, site.longitude, after_metadata.get("acquisition_time"))
     patch_distances = _cosine_distances(before_patches, after_patches)
     grid_size = int(math.sqrt(patch_distances.size))
@@ -1076,6 +1086,7 @@ class RankDataCenterBuildout(Task):
         return "tilebox.com/datacenters/RankDataCenterBuildout", "v1.14"
 
     def execute(self, context: ExecutionContext):  # noqa: ANN201
+        context = cast(Any, context)
         context.current_task.display = "RankDataCenterBuildout"
         status_filter = self.status_filter if self.status_filter is not None else DEFAULT_STATUS_FILTER
         sites = _merge_sites(self.csv_url, self.max_sites, self.random_seed, status_filter)
@@ -1138,6 +1149,7 @@ class SelectAndCacheScene(Task):
         return "tilebox.com/datacenters/SelectAndCacheScene", "v1.14"
 
     def execute(self, context: ExecutionContext):  # noqa: ANN201, PLR0915
+        context = cast(Any, context)
         site = _sites_by_id(context.job_cache["sites.json"])[self.site_id]
         context.current_task.display = f"Select {self.label} {site.site_id}"
         metadata_key = f"scenes/{site.site_id}/{self.label}/metadata.json"
@@ -1342,6 +1354,7 @@ class ComputeSiteChange(Task):
         return "tilebox.com/datacenters/ComputeSiteChange", "v1.14"
 
     def execute(self, context: ExecutionContext):  # noqa: ANN201
+        context = cast(Any, context)
         site = _sites_by_id(context.job_cache["sites.json"])[self.site_id]
         context.current_task.display = f"Compute {site.site_id}"
         before_metadata = _json_loads(context.job_cache[f"scenes/{site.site_id}/before/metadata.json"])
@@ -1392,12 +1405,12 @@ class ComputeSiteChange(Task):
 
 
 class WriteRankingOutput(Task):
-
     @staticmethod
     def identifier() -> tuple[str, str]:
         return "tilebox.com/datacenters/WriteRankingOutput", "v1.14"
 
     def execute(self, context: ExecutionContext):  # noqa: ANN201
+        context = cast(Any, context)
         site_ids = list(_sites_by_id(context.job_cache["sites.json"]))
         context.current_task.display = f"WriteRankingOutput(n={len(site_ids)})"
         results = [_json_loads(context.job_cache[f"results/{site_id}.json"]) for site_id in site_ids]
@@ -1405,7 +1418,7 @@ class WriteRankingOutput(Task):
         for rank, item in enumerate(results, start=1):
             item["rank"] = rank
         output = {
-            "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "generated_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
             "ranking": results,
         }
         context.job_cache["outputs/ranking.json"] = _json_dumps(output)
