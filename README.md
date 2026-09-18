@@ -126,6 +126,12 @@ Install dependencies:
 uv sync
 ```
 
+For local development without Google Cloud credentials, use the local workflow cache:
+
+```bash
+export WORKFLOW_CACHE_BUCKET=""
+```
+
 Publish and deploy the workflow release:
 
 ```bash
