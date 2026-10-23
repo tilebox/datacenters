@@ -109,12 +109,8 @@ Do not just ask a question — build the product.
 
 - Python 3.12 and `uv`
 - Tilebox CLI, and a Tilebox API key from the [Tilebox Console](https://console.tilebox.com) - sign up for free!
-- [Copernicus Data Space S3 credentials](https://docs.tilebox.com/storage/clients#access-copernicus-data)
 
-```bash
-export COPERNICUS_ACCESS_KEY="..."
-export COPERNICUS_SECRET_KEY="..."
-```
+Sentinel-2 imagery is discovered through Tilebox and read from the public AWS Open Data COG archive; no AWS credentials are required.
 
 The workflow lazily downloads the Clay v1.5 checkpoint on first use and caches it under `~/.cache/tilebox/models/`. 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import math
@@ -16,16 +17,17 @@ import niquests
 import numpy as np
 import pandas as pd
 import pyproj
-import rasterio
-from google.cloud.storage import Client as StorageClient
-from obstore.store import LocalStore, ObjectStore, S3Store
+from google.cloud.storage import Client as GoogleStorageClient
 from PIL import Image
 from rasterio.enums import Resampling
 from rasterio.transform import array_bounds
 from rasterio.warp import reproject
-from rasterio.windows import from_bounds
 from shapely.geometry import Polygon, mapping
 from tilebox.datasets import Client as DatasetClient
+from tilebox.datasets import field
+from tilebox.datasets.assets import AssetCollection
+from tilebox.storage.aio import Client as StorageClient
+from tilebox.storage.geotiff import window_from_bounds
 from tilebox.workflows import ExecutionContext, Runner, Task
 from tilebox.workflows.cache import GoogleStorageCache, JobCache, LocalFileSystemCache
 
@@ -37,8 +39,9 @@ DEFAULT_STATUS_FILTER = ["Approved/Permitted/Under construction", "Expanding", "
 DEFAULT_GCS_CACHE_PROJECT = "tilebox-hosted-compute"
 DEFAULT_GCS_CACHE_BUCKET = "tilebox-hosted-compute-us-central1-results"
 DEFAULT_GCS_CACHE_PREFIX = "jobs"
+SENTINEL2_DATASET = "open_data.aws_earth.sentinel2"
+SENTINEL2_COLLECTION = "L2A"
 
-SENTINEL2_COLLECTIONS = ["S2A_S2MSI2A", "S2B_S2MSI2A", "S2C_S2MSI2A"]
 BAND_NAMES = ["B02", "B03", "B04", "B08", "B11", "B12"]
 CLAY_BAND_NAMES = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"]
 ALL_BAND_NAMES = sorted(set(BAND_NAMES) | set(CLAY_BAND_NAMES))
@@ -56,18 +59,18 @@ CLAY_INPUT_SIZE = 256
 CLAY_PATCH_SIZE = 8
 CLAY_EMBEDDING_DIM = 1024
 
-JP2_BAND_ASSET_SUFFIXES = {
-    "B02": ("B02_10m.jp2",),
-    "B03": ("B03_10m.jp2",),
-    "B04": ("B04_10m.jp2",),
-    "B05": ("B05_20m.jp2",),
-    "B06": ("B06_20m.jp2",),
-    "B07": ("B07_20m.jp2",),
-    "B08": ("B08_10m.jp2",),
-    "B8A": ("B8A_20m.jp2",),
-    "B11": ("B11_20m.jp2",),
-    "B12": ("B12_20m.jp2",),
-    "SCL": ("SCL_20m.jp2",),
+SENTINEL2_BAND_ASSETS = {
+    "B02": "blue",
+    "B03": "green",
+    "B04": "red",
+    "B05": "rededge1",
+    "B06": "rededge2",
+    "B07": "rededge3",
+    "B08": "nir",
+    "B8A": "nir08",
+    "B11": "swir16",
+    "B12": "swir22",
+    "SCL": "scl",
 }
 
 
@@ -100,26 +103,6 @@ class SceneMetadata:
     message: str | None = None
 
 
-@lru_cache
-def sentinel2_data_store() -> ObjectStore:
-    eodata_mounted = Path("/eodata")
-    if eodata_mounted.exists():
-        return LocalStore(eodata_mounted)
-
-    access_key = os.environ.get("COPERNICUS_ACCESS_KEY")
-    secret_key = os.environ.get("COPERNICUS_SECRET_KEY")
-    if access_key is None or secret_key is None:
-        raise ValueError("COPERNICUS_ACCESS_KEY and COPERNICUS_SECRET_KEY must be set")
-
-    endpoint = os.environ.get("COPERNICUS_S3_ENDPOINT", "https://eodata.dataspace.copernicus.eu")
-    return S3Store(
-        bucket="eodata",
-        endpoint=endpoint,
-        access_key_id=access_key,
-        secret_access_key=secret_key,
-    )
-
-
 def workflow_cache() -> JobCache:
     cache_url = os.environ.get(
         "WORKFLOW_CACHE_BUCKET",
@@ -134,7 +117,7 @@ def workflow_cache() -> JobCache:
     bucket_name = bucket_and_prefix[0]
     prefix = bucket_and_prefix[1] if len(bucket_and_prefix) == 2 else "jobs"
     project = os.environ.get("WORKFLOW_CACHE_GCP_PROJECT", DEFAULT_GCS_CACHE_PROJECT)
-    bucket = StorageClient(project=project).bucket(bucket_name)
+    bucket = GoogleStorageClient(project=project).bucket(bucket_name)
     return GoogleStorageCache(bucket, prefix=prefix)
 
 
@@ -311,11 +294,12 @@ def _dataset_candidates(  # noqa: PLR0913
     area = _site_crop_polygon(latitude, longitude, crop_size_m)
     data = (
         DatasetClient()
-        .dataset("open_data.copernicus.sentinel2_msi")
+        .dataset(SENTINEL2_DATASET)
+        .collection(SENTINEL2_COLLECTION)
         .query(
-            collections=SENTINEL2_COLLECTIONS,
             temporal_extent=(start, end),
             spatial_extent=area,
+            filter=field("cloud_cover") <= scene_cloud_cover_max,
             show_progress=False,
         )
     )
@@ -325,21 +309,23 @@ def _dataset_candidates(  # noqa: PLR0913
     candidates: list[dict[str, Any]] = []
     cloud_covers = data["cloud_cover"].to_numpy()
     times = data["time"].to_numpy()
-    granule_names = data["granule_name"].to_numpy()
+    product_uris = data["product_uri"].to_numpy()
     geometries = data["geometry"].to_numpy()
-    locations = data["location"].to_numpy()
     for index in range(data.sizes["time"]):
         cloud_cover = float(cloud_covers[index])
         if cloud_cover > scene_cloud_cover_max:
             continue
         time_value = pd.Timestamp(times[index]).to_pydatetime()
+        datapoint = data.isel(time=index)
+        assets = AssetCollection.from_datapoint(datapoint)
         candidates.append(
             {
                 "time": time_value,
-                "granule_name": str(granule_names[index]),
-                "location": str(locations[index]).removeprefix("/eodata/"),
+                "granule_name": str(product_uris[index]),
                 "cloud_cover": cloud_cover,
                 "geometry": geometries[index],
+                "assets": assets,
+                "data_location": assets["red"].primary.href.rsplit("/", 1)[0],
             }
         )
 
@@ -348,71 +334,45 @@ def _dataset_candidates(  # noqa: PLR0913
     return candidates
 
 
-def _find_copernicus_jp2_assets(granule_location: str) -> dict[str, str]:
-    jp2_assets: dict[str, str] = {}
-    for page in sentinel2_data_store().list(granule_location):
-        for obj in page:
-            path = obj["path"]
-            for band_name, suffixes in JP2_BAND_ASSET_SUFFIXES.items():
-                if band_name not in jp2_assets and any(path.endswith(suffix) for suffix in suffixes):
-                    jp2_assets[band_name] = path
-    return jp2_assets
-
-
 def _bounds_for_crs(polygon_wgs84: Polygon, crs: Any) -> tuple[float, float, float, float]:
     transformer = pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True)
     xs: list[float] = []
     ys: list[float] = []
-    for lon, lat in polygon_wgs84.exterior.coords:
-        x, y = transformer.transform(lon, lat)
+    for longitude, latitude in polygon_wgs84.exterior.coords:
+        x, y = transformer.transform(longitude, latitude)
         xs.append(x)
         ys.append(y)
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def _read_jp2_asset_crop(asset_path: str, polygon_wgs84: Polygon) -> tuple[np.ndarray, Any, Any]:
-    eodata_path = Path("/eodata") / asset_path
-    if eodata_path.exists():
-        with rasterio.open(eodata_path, driver="JP2OpenJPEG") as source:
-            window = from_bounds(*_bounds_for_crs(polygon_wgs84, source.crs), transform=source.transform)
-            window = window.round_offsets().round_lengths()
-            data = source.read(1, window=window, boundless=False)
-            return data, source.window_transform(window), source.crs
-
-    buffer = bytes(sentinel2_data_store().get(asset_path).bytes())
-    with rasterio.MemoryFile(buffer).open(driver="JP2OpenJPEG") as source:
-        window = from_bounds(*_bounds_for_crs(polygon_wgs84, source.crs), transform=source.transform)
-        window = window.round_offsets().round_lengths()
-        data = source.read(1, window=window, boundless=False)
-        return data, source.window_transform(window), source.crs
-
-
-def _read_crop(
-    asset_paths: dict[str, str],
+async def _read_crop_async(
+    assets: AssetCollection,
     latitude: float,
     longitude: float,
     crop_size_m: int,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     polygon_wgs84 = _site_crop_polygon(latitude, longitude, crop_size_m)
+    storage = StorageClient()
+
+    async def read_band(band_name: str) -> tuple[np.ndarray, Any, Any]:
+        geotiff = await storage.open_geotiff(assets[SENTINEL2_BAND_ASSETS[band_name]])
+        bounds = _bounds_for_crs(polygon_wgs84, geotiff.crs)
+        window = window_from_bounds(geotiff, bounds, crs=geotiff.crs)
+        raster = await geotiff.read(window=window)
+        return raster.data[0], raster.transform, raster.crs
+
+    band_names = [*ALL_BAND_NAMES, "SCL"]
+    source_bands = dict(zip(band_names, await asyncio.gather(*(read_band(name) for name in band_names)), strict=True))
 
     arrays: dict[str, np.ndarray] = {}
-    reference_transform = None
-    reference_crs = None
-    reference_shape = None
-
+    reference_data, reference_transform, reference_crs = source_bands["B04"]
+    reference_shape = reference_data.shape
     for band_name in ["B04", "B03", "B02", "B08"]:
-        data, transform, crs = _read_jp2_asset_crop(asset_paths[band_name], polygon_wgs84)
+        data, _, _ = source_bands[band_name]
         arrays[band_name] = data
-        if reference_transform is None:
-            reference_transform = transform
-            reference_crs = crs
-            reference_shape = data.shape
-
-    if reference_transform is None or reference_crs is None or reference_shape is None:
-        raise ValueError("Could not read reference Sentinel-2 bands")
 
     for band_name in ["B05", "B06", "B07", "B8A", "B11", "B12", "SCL"]:
-        source_data, source_transform, source_crs = _read_jp2_asset_crop(asset_paths[band_name], polygon_wgs84)
+        source_data, source_transform, source_crs = source_bands[band_name]
         destination = np.empty(reference_shape, dtype=source_data.dtype)
         reproject(
             source_data,
@@ -1086,7 +1046,6 @@ class RankDataCenterBuildout(Task):
         return "tilebox.com/datacenters/RankDataCenterBuildout", "v1.14"
 
     def execute(self, context: ExecutionContext):  # noqa: ANN201
-        context = cast(Any, context)
         context.current_task.display = "RankDataCenterBuildout"
         status_filter = self.status_filter if self.status_filter is not None else DEFAULT_STATUS_FILTER
         sites = _merge_sites(self.csv_url, self.max_sites, self.random_seed, status_filter)
@@ -1148,8 +1107,7 @@ class SelectAndCacheScene(Task):
     def identifier() -> tuple[str, str]:
         return "tilebox.com/datacenters/SelectAndCacheScene", "v1.14"
 
-    def execute(self, context: ExecutionContext):  # noqa: ANN201, PLR0915
-        context = cast(Any, context)
+    async def execute(self, context: ExecutionContext):  # noqa: ANN201, PLR0915
         site = _sites_by_id(context.job_cache["sites.json"])[self.site_id]
         context.current_task.display = f"Select {self.label} {site.site_id}"
         metadata_key = f"scenes/{site.site_id}/{self.label}/metadata.json"
@@ -1186,36 +1144,42 @@ class SelectAndCacheScene(Task):
 
             skipped_granule_names = []
             for candidate in candidates:
-                with context.tracer.span("list-copernicus-assets") as span:
+                assets = candidate["assets"]
+                data_location = candidate["data_location"]
+                missing_assets = sorted(set(SENTINEL2_BAND_ASSETS.values()) - set(assets))
+                asset_paths = {
+                    band_name: assets[asset_name].primary.href
+                    for band_name, asset_name in SENTINEL2_BAND_ASSETS.items()
+                    if asset_name in assets
+                }
+                with context.tracer.span("resolve-sentinel-assets") as span:
                     span.set_attribute("scene_id", candidate["granule_name"])
-                    span.set_attribute("data_location", candidate["location"])
-                    assets = _find_copernicus_jp2_assets(candidate["location"])
-                    missing_assets = sorted(set(JP2_BAND_ASSET_SUFFIXES) - set(assets))
+                    span.set_attribute("data_location", data_location)
                     span.set_attribute("asset_count", len(assets))
-                    span.set_attribute("asset_format", "jp2")
+                    span.set_attribute("asset_format", "cog")
                     span.set_attribute("missing_assets", ",".join(missing_assets))
 
                 if missing_assets:
                     skipped_granule_names.append(candidate["granule_name"])
                     log.info(
-                        "Skipped candidate because expected Copernicus JP2 assets were not found",
-                        skip_reason="missing_copernicus_jp2_assets",
+                        "Skipped candidate because expected AWS COG assets were not found",
+                        skip_reason="missing_aws_cog_assets",
                         scene_id=candidate["granule_name"],
-                        data_location=candidate["location"],
-                        found_asset_names=", ".join(sorted(assets)),
+                        data_location=data_location,
+                        found_asset_names=", ".join(sorted(set(assets))),
                         missing_assets=", ".join(missing_assets),
                         scene_cloud_cover=candidate["cloud_cover"],
                     )
                     continue
 
-                with context.tracer.span("download-cropped-assets") as span:
+                with context.tracer.span("read-cog-crops") as span:
                     span.set_attribute("scene_id", candidate["granule_name"])
-                    span.set_attribute("data_location", candidate["location"])
-                    span.set_attribute("asset_format", "jp2")
-                    for band_name, asset_path in assets.items():
+                    span.set_attribute("data_location", data_location)
+                    span.set_attribute("asset_format", "cog")
+                    for band_name, asset_path in asset_paths.items():
                         span.set_attribute(f"asset.{band_name}", asset_path)
                     try:
-                        arrays, crop_metadata = _read_crop(
+                        arrays, crop_metadata = await _read_crop_async(
                             assets,
                             site.latitude,
                             site.longitude,
@@ -1227,11 +1191,11 @@ class SelectAndCacheScene(Task):
                         span.set_attribute("error", str(error))
                         skipped_granule_names.append(candidate["granule_name"])
                         log.info(
-                            "Skipped candidate because Copernicus crop read failed",
-                            skip_reason="copernicus_asset_read_failed",
+                            "Skipped candidate because AWS COG crop read failed",
+                            skip_reason="aws_cog_read_failed",
                             scene_id=candidate["granule_name"],
-                            data_location=candidate["location"],
-                            asset_format="jp2",
+                            data_location=data_location,
+                            asset_format="cog",
                             error=str(error),
                             scene_cloud_cover=candidate["cloud_cover"],
                         )
@@ -1244,7 +1208,7 @@ class SelectAndCacheScene(Task):
                         "Skipped candidate because crop did not cover the full target area",
                         skip_reason="partial_crop_overlap",
                         scene_id=candidate["granule_name"],
-                        data_location=candidate["location"],
+                        data_location=data_location,
                         crop_height=crop_metadata["height"],
                         crop_width=crop_metadata["width"],
                         expected_min_crop_pixels=expected_crop_pixels,
@@ -1259,7 +1223,7 @@ class SelectAndCacheScene(Task):
                         "Skipped candidate because crop contains too much invalid or padded data",
                         skip_reason="crop_invalid_data_too_high",
                         scene_id=candidate["granule_name"],
-                        data_location=candidate["location"],
+                        data_location=data_location,
                         crop_invalid_percent=crop_invalid_percent,
                         crop_invalid_percent_max=MAX_CROP_INVALID_PERCENT,
                         scene_cloud_cover=candidate["cloud_cover"],
@@ -1270,7 +1234,7 @@ class SelectAndCacheScene(Task):
                 log.info(
                     "Computed crop cloud cover",
                     scene_id=candidate["granule_name"],
-                    data_location=candidate["location"],
+                    data_location=data_location,
                     crop_cloud_cover=crop_cloud_cover,
                     crop_invalid_percent=crop_invalid_percent,
                     scene_cloud_cover=candidate["cloud_cover"],
@@ -1281,7 +1245,7 @@ class SelectAndCacheScene(Task):
                         "Skipped candidate because crop cloud cover was too high",
                         skip_reason="crop_cloud_cover_too_high",
                         scene_id=candidate["granule_name"],
-                        data_location=candidate["location"],
+                        data_location=data_location,
                         crop_cloud_cover=crop_cloud_cover,
                         crop_cloud_cover_max=self.crop_cloud_cover_max,
                         scene_cloud_cover=candidate["cloud_cover"],
@@ -1290,9 +1254,9 @@ class SelectAndCacheScene(Task):
 
                 crop_metadata.update(
                     {
-                        "data_location": candidate["location"],
-                        "asset_format": "jp2",
-                        "asset_paths": assets,
+                        "data_location": data_location,
+                        "asset_format": "cog",
+                        "asset_paths": asset_paths,
                         "scene_id": candidate["granule_name"],
                         "acquisition_time": candidate["time"].isoformat(),
                         "crop_invalid_percent": crop_invalid_percent,
@@ -1319,8 +1283,8 @@ class SelectAndCacheScene(Task):
                     scene_cloud_cover=candidate["cloud_cover"],
                     bands_key=bands_key,
                     preview_key=preview_key,
-                    data_location=candidate["location"],
-                    asset_format="jp2",
+                    data_location=data_location,
+                    asset_format="cog",
                 )
                 context.job_cache[metadata_key] = _json_dumps(asdict(metadata))
                 return
@@ -1354,7 +1318,6 @@ class ComputeSiteChange(Task):
         return "tilebox.com/datacenters/ComputeSiteChange", "v1.14"
 
     def execute(self, context: ExecutionContext):  # noqa: ANN201
-        context = cast(Any, context)
         site = _sites_by_id(context.job_cache["sites.json"])[self.site_id]
         context.current_task.display = f"Compute {site.site_id}"
         before_metadata = _json_loads(context.job_cache[f"scenes/{site.site_id}/before/metadata.json"])
@@ -1410,7 +1373,6 @@ class WriteRankingOutput(Task):
         return "tilebox.com/datacenters/WriteRankingOutput", "v1.14"
 
     def execute(self, context: ExecutionContext):  # noqa: ANN201
-        context = cast(Any, context)
         site_ids = list(_sites_by_id(context.job_cache["sites.json"]))
         context.current_task.display = f"WriteRankingOutput(n={len(site_ids)})"
         results = [_json_loads(context.job_cache[f"results/{site_id}.json"]) for site_id in site_ids]
